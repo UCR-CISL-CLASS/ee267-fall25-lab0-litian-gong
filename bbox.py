@@ -446,11 +446,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Dump a COCO-like JSON file with bounding boxes",
     )
     parser.add_argument(
-        "--sync",
-        action="store_true",
-        help="Run the simulation in synchronous mode",
-    )
-    parser.add_argument(
         "--fixed-delta",
         type=float,
         default=0.05,
@@ -500,7 +495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     blueprint_library = world.get_blueprint_library()
     traffic_manager = client.get_trafficmanager(args.traffic_manager_port)
-    traffic_manager.set_synchronous_mode(args.sync)
+    traffic_manager.set_synchronous_mode(True)
     traffic_manager.set_random_device_seed(args.seed)
 
     hero = spawn_hero(world, blueprint_library, map_spawn_points, seed=args.seed)
@@ -573,12 +568,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     frame_counter = 0
 
     try:
-        with synchronous_mode(world, args.sync, fixed_delta=args.fixed_delta):
+        with synchronous_mode(world, True, fixed_delta=args.fixed_delta):
             while saved_frames < args.frames:
-                if args.sync:
-                    world.tick()
-                else:
-                    world.wait_for_tick()
+                world.tick()
 
                 frame_counter += 1
                 should_save = frame_counter % args.frame_step == 0
