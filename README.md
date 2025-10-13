@@ -92,7 +92,8 @@ Outputs:
 - A COCO-like JSON file (`output/bbox/bounding_boxes.json`) containing the frame number, timestamp, and `[x_min, y_min, x_max, y_max]` for each visible vehicle.
 
 ### 3.3 Implementation highlights
-- Builds the intrinsic matrix with the tutorial formula `f = width / (2 * tan(fov/2))`.
+- Builds the intrinsic projection matrix with `build_projection_matrix`, including a flipped variant for vertices that land behind the sensor.
+- Uses `get_image_point` to wrap the world ➜ camera ➜ pixel transformation and to surface both camera-space and image-space coordinates for every vertex.
 - Converts UE4 coordinates to a conventional camera space `(x, y, z) -> (y, -z, x)` before projecting all eight vertices of each bounding box.
 - Rejects actors that are behind the camera, outside the image plane, or farther than the configured threshold.
 

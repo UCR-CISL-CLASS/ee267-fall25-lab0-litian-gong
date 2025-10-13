@@ -10,7 +10,6 @@ results for dataset creation.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import logging
 import math
@@ -19,7 +18,7 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 try:
     import numpy as np
@@ -82,58 +81,74 @@ class ActorProjection:
     vertices_camera: List[np.ndarray]
 
 
-class SensorQueue(queue.Queue):
-    """Simple queue wrapper with a blocking get that exposes timeouts."""
+class CarlaSyncMode:
+    """Helper to keep world snapshots and sensor streams perfectly synchronized."""
 
-    def get(self, timeout: float | None = None):  # type: ignore[override]
-        try:
-            return super().get(timeout=timeout)
-        except queue.Empty as exc:  # pragma: no cover - runtime guard
-            raise RuntimeError("Timed out waiting for sensor data") from exc
+    def __init__(self, world: carla.World, *sensors: carla.Sensor, fps: float | None = None):
+        self.world = world
+        self.sensors = sensors
+        self.fps = fps
+        self._queues: List[queue.Queue] = []
+        self._settings: carla.WorldSettings | None = None
+        self.frame: int | None = None
 
+    def __enter__(self) -> CarlaSyncMode:
+        original = self.world.get_settings()
+        self._settings = original
 
-@contextlib.contextmanager
-def synchronous_mode(
-    world: carla.World,
-    enable: bool,
-    *,
-    fixed_delta: float | None = None,
-) -> Iterator[None]:
-    """Context manager mirroring the tutorial pattern."""
+        if self.fps and self.fps > 0.0:
+            fixed_delta = 1.0 / self.fps
+        else:
+            fixed_delta = original.fixed_delta_seconds if original.fixed_delta_seconds else 0.05
 
-    original = world.get_settings()
-    if not enable:
-        yield
-        return
+        settings = carla.WorldSettings(
+            synchronous_mode=True,
+            no_rendering_mode=original.no_rendering_mode,
+            fixed_delta_seconds=fixed_delta,
+            substepping=original.substepping,
+            max_substep_delta_time=original.max_substep_delta_time,
+            max_substeps=original.max_substeps,
+            max_culling_distance=original.max_culling_distance,
+            deterministic_ragdolls=original.deterministic_ragdolls,
+            tile_stream_distance=original.tile_stream_distance,
+            actor_active_distance=original.actor_active_distance,
+            spectator_as_ego=original.spectator_as_ego,
+        )
 
-    # carla.WorldSettings 没有复制构造函数，需要手动重建设置。
-    target_fixed_delta = (
-        fixed_delta
-        if fixed_delta is not None
-        else (original.fixed_delta_seconds if original.fixed_delta_seconds else 0.05)
-    )
+        logging.debug("Enabling CarlaSyncMode (fixed_delta=%.3fs)", settings.fixed_delta_seconds)
+        self.world.apply_settings(settings)
 
-    settings = carla.WorldSettings(
-        synchronous_mode=True,
-        no_rendering_mode=original.no_rendering_mode,
-        fixed_delta_seconds=target_fixed_delta,
-        substepping=original.substepping,
-        max_substep_delta_time=original.max_substep_delta_time,
-        max_substeps=original.max_substeps,
-        max_culling_distance=original.max_culling_distance,
-        deterministic_ragdolls=original.deterministic_ragdolls,
-        tile_stream_distance=original.tile_stream_distance,
-        actor_active_distance=original.actor_active_distance,
-        spectator_as_ego=original.spectator_as_ego,
-    )
+        self._queues.clear()
 
-    logging.debug("Enabling synchronous mode (fixed_delta=%.3fs)", target_fixed_delta)
-    world.apply_settings(settings)
-    try:
-        yield
-    finally:
-        logging.debug("Restoring original world settings")
-        world.apply_settings(original)
+        def make_queue(register_event):
+            q: queue.Queue = queue.Queue()
+            register_event(q.put)
+            self._queues.append(q)
+
+        make_queue(self.world.on_tick)
+        for sensor in self.sensors:
+            make_queue(sensor.listen)
+
+        return self
+
+    def tick(self, timeout: float) -> List[object]:
+        self.frame = self.world.tick()
+        data = [self._retrieve(q, timeout) for q in self._queues]
+        assert all(getattr(item, "frame", self.frame) == self.frame for item in data)
+        return data
+
+    def _retrieve(self, q: queue.Queue, timeout: float):
+        while True:
+            data = q.get(timeout=timeout)
+            if getattr(data, "frame", None) == self.frame:
+                return data
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        logging.debug("Restoring world settings after CarlaSyncMode")
+        if self._settings is not None:
+            self.world.apply_settings(self._settings)
+        for sensor in self.sensors:
+            sensor.stop()
 
 
 def spawn_hero(
@@ -237,14 +252,43 @@ BOX_EDGES: Tuple[Tuple[int, int], ...] = (
 )
 
 
-def build_projection_matrix(width: int, height: int, fov: float, *, flip: bool = False) -> np.ndarray:
-    focal = width / (2.0 * math.tan(fov * math.pi / 360.0))
+def build_projection_matrix(
+    width: int,
+    height: int,
+    fov: float,
+    *,
+    flip: bool = False,
+) -> np.ndarray:
+    """Construct the intrinsic projection matrix used to map camera points to pixels."""
+    focal = width / (2.0 * math.tan(math.radians(fov) / 2.0))
     sign = -1.0 if flip else 1.0
-    return np.array([
-        [sign * focal, 0.0, width / 2.0],
-        [0.0, sign * focal, height / 2.0],
-        [0.0, 0.0, 1.0],
-    ])
+    projection = np.zeros((3, 4), dtype=float)
+    projection[0, 0] = sign * focal
+    projection[1, 1] = sign * focal
+    projection[0, 2] = width / 2.0
+    projection[1, 2] = height / 2.0
+    projection[2, 2] = 1.0
+    return projection
+
+
+def get_image_point(
+    location: carla.Location,
+    world_2_camera: np.ndarray,
+    K_front: np.ndarray,
+    K_back: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project a world-space point to pixel coordinates and return the camera-space point."""
+    point_camera = location_to_camera(location, world_2_camera)
+    if abs(point_camera[2]) < 1e-6:
+        point_camera[2] = 1e-6 if point_camera[2] >= 0 else -1e-6
+
+    point_h = np.array([point_camera[0], point_camera[1], point_camera[2], 1.0])
+    projection = K_front if point_camera[2] >= 0 else K_back
+    clip_space = projection @ point_h
+    if abs(clip_space[2]) < 1e-6:
+        clip_space[2] = 1e-6 if clip_space[2] >= 0 else -1e-6
+    point = clip_space[:2] / clip_space[2]
+    return point, point_camera
 
 
 def location_to_camera(
@@ -256,20 +300,6 @@ def location_to_camera(
     point_camera = world_2_camera @ point
     # Convert from UE4 (X-forward, Y-right, Z-up) to standard (X-right, Y-down, Z-forward).
     return np.array([point_camera[1], -point_camera[2], point_camera[0]])
-
-
-def project_camera_point(
-    point_camera: np.ndarray,
-    K_front: np.ndarray,
-    K_back: np.ndarray,
-) -> np.ndarray:
-    point = point_camera.copy()
-    if abs(point[2]) < 1e-6:
-        point[2] = 1e-6 if point[2] >= 0 else -1e-6
-    projection = K_front if point[2] > 0 else K_back
-    point_img = projection @ point
-    point_img /= point_img[2]
-    return point_img[:2]
 
 
 def point_in_canvas(point: np.ndarray, image_w: int, image_h: int) -> bool:
@@ -304,14 +334,15 @@ def compute_actor_projection(
 
     bbox = actor.bounding_box
     vertices = bbox.get_world_vertices(actor_transform)
-    vertices_camera = [location_to_camera(vertex, world_2_camera) for vertex in vertices]
+    vertices_camera: List[np.ndarray] = []
+    vertices_image: List[np.ndarray] = []
+    for vertex in vertices:
+        image_point, camera_point = get_image_point(vertex, world_2_camera, K_front, K_back)
+        vertices_camera.append(camera_point)
+        vertices_image.append(image_point)
 
     if not any(vertex_cam[2] > 0 for vertex_cam in vertices_camera):
         return None
-
-    vertices_image = [
-        project_camera_point(vertex_cam, K_front, K_back) for vertex_cam in vertices_camera
-    ]
 
     xs = [point[0] for point in vertices_image]
     ys = [point[1] for point in vertices_image]
@@ -526,9 +557,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
     )
 
-    sensor_queue: SensorQueue = SensorQueue()
-    camera.listen(sensor_queue.put)
-
     save_raw = args.save_raw or args.save_images or args.save_voc
     save_2d = args.save_2d or args.save_images
     save_3d = args.save_3d
@@ -566,128 +594,129 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     saved_frames = 0
     frame_counter = 0
+    fps = 1.0 / args.fixed_delta if args.fixed_delta and args.fixed_delta > 0.0 else None
 
     try:
-        with synchronous_mode(world, True, fixed_delta=args.fixed_delta):
+        with CarlaSyncMode(world, camera, fps=fps) as sync_mode:
             while saved_frames < args.frames:
-                world.tick()
-
+                world_snapshot, image = sync_mode.tick(timeout=args.timeout)
                 frame_counter += 1
-                should_save = frame_counter % args.frame_step == 0
-                image = sensor_queue.get(timeout=args.timeout)
+                if frame_counter % args.frame_step != 0:
+                    continue
 
-                if should_save:
-                    camera_tf = camera.get_transform()
-                    world_2_camera = np.array(camera_tf.get_inverse_matrix())
-                    camera_location = camera_tf.location
+                logging.info(
+                    "[SYNC] world frame=%s, image frame=%s",
+                    world_snapshot.frame,
+                    image.frame,
+                )
 
-                    image_w = image.width
-                    image_h = image.height
-                    projection_front = build_projection_matrix(image_w, image_h, args.fov)
-                    projection_back = build_projection_matrix(
-                        image_w, image_h, args.fov, flip=True
+                camera_tf = camera.get_transform()
+                world_2_camera = np.array(camera_tf.get_inverse_matrix())
+                camera_location = camera_tf.location
+                image_w = image.width
+                image_h = image.height
+                projection_front = build_projection_matrix(image_w, image_h, args.fov)
+                projection_back = build_projection_matrix(image_w, image_h, args.fov, flip=True)
+
+                frame_projections: List[ActorProjection] = []
+                actors = world.get_actors().filter("*vehicle*")
+                for actor in actors:
+                    projection_result = compute_actor_projection(
+                        actor,
+                        camera_transform=camera_tf,
+                        world_2_camera=world_2_camera,
+                        K_front=projection_front,
+                        K_back=projection_back,
+                        image_w=image_w,
+                        image_h=image_h,
+                        max_distance=args.max_distance,
+                        camera_location=camera_location,
+                        ignore_actor_ids=ignored_actor_ids,
                     )
+                    if projection_result:
+                        frame_projections.append(projection_result)
 
-                    frame_projections: List[ActorProjection] = []
-                    actors = world.get_actors().filter("*vehicle*")
-                    for actor in actors:
-                        projection_result = compute_actor_projection(
-                            actor,
-                            camera_transform=camera_tf,
-                            world_2_camera=world_2_camera,
-                            K_front=projection_front,
-                            K_back=projection_back,
-                            image_w=image_w,
-                            image_h=image_h,
-                            max_distance=args.max_distance,
-                            camera_location=camera_location,
-                            ignore_actor_ids=ignored_actor_ids,
-                        )
-                        if projection_result:
-                            frame_projections.append(projection_result)
+                frame_boxes: List[BoundingBox2D] = [
+                    projection.bbox2d for projection in frame_projections
+                ]
 
-                    frame_boxes: List[BoundingBox2D] = [
-                        projection.bbox2d for projection in frame_projections
-                    ]
+                need_image_buffer = save_raw or save_2d or save_3d
+                img_bgr = None
+                if need_image_buffer:
+                    img_bgra = np.frombuffer(image.raw_data, dtype=np.uint8)
+                    img_bgra = np.reshape(img_bgra, (image_h, image_w, 4))
+                    img_bgr = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
 
-                    need_image_buffer = save_raw or save_2d or save_3d
-                    img_bgr = None
-                    if need_image_buffer:
-                        img_bgra = np.frombuffer(image.raw_data, dtype=np.uint8)
-                        img_bgra = np.reshape(img_bgra, (image_h, image_w, 4))
-                        img_bgr = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
+                raw_path: Path | None = None
+                if save_raw and raw_dir and img_bgr is not None:
+                    raw_path = raw_dir / f"{image.frame:06d}.png"
+                    cv2.imwrite(str(raw_path), img_bgr)
 
-                    raw_path: Path | None = None
-                    if save_raw and raw_dir and img_bgr is not None:
-                        raw_path = raw_dir / f"{image.frame:06d}.png"
+                if save_2d and detect_2d_dir and img_bgr is not None:
+                    img_2d = img_bgr.copy()
+                    for box in frame_boxes:
+                        pt1 = (int(round(box.x_min)), int(round(box.y_min)))
+                        pt2 = (int(round(box.x_max)), int(round(box.y_max)))
+                        cv2.rectangle(img_2d, pt1, pt2, (0, 0, 255), 2)
+                    detect2d_path = detect_2d_dir / f"{image.frame:06d}.png"
+                    cv2.imwrite(str(detect2d_path), img_2d)
+
+                if save_3d and detect_3d_dir and img_bgr is not None:
+                    img_3d = img_bgr.copy()
+                    for projection in frame_projections:
+                        for start, end in BOX_EDGES:
+                            p_start = projection.vertices_image[start]
+                            p_end = projection.vertices_image[end]
+                            inside_start = point_in_canvas(p_start, image_w, image_h)
+                            inside_end = point_in_canvas(p_end, image_w, image_h)
+                            if not inside_start and not inside_end:
+                                continue
+                            if (
+                                projection.vertices_camera[start][2] <= 0
+                                and projection.vertices_camera[end][2] <= 0
+                            ):
+                                continue
+                            pt1 = (int(round(p_start[0])), int(round(p_start[1])))
+                            pt2 = (int(round(p_end[0])), int(round(p_end[1])))
+                            cv2.line(img_3d, pt1, pt2, (0, 255, 0), 1)
+                    detect3d_path = detect_3d_dir / f"{image.frame:06d}.png"
+                    cv2.imwrite(str(detect3d_path), img_3d)
+
+                if args.save_voc and Writer and voc_dir:
+                    if raw_path is None and img_bgr is not None:
+                        raw_path = output_dir / f"{image.frame:06d}.png"
                         cv2.imwrite(str(raw_path), img_bgr)
-
-                    if save_2d and detect_2d_dir and img_bgr is not None:
-                        img_2d = img_bgr.copy()
-                        for box in frame_boxes:
-                            pt1 = (int(round(box.x_min)), int(round(box.y_min)))
-                            pt2 = (int(round(box.x_max)), int(round(box.y_max)))
-                            cv2.rectangle(img_2d, pt1, pt2, (0, 0, 255), 2)
-                        detect2d_path = detect_2d_dir / f"{image.frame:06d}.png"
-                        cv2.imwrite(str(detect2d_path), img_2d)
-
-                    if save_3d and detect_3d_dir and img_bgr is not None:
-                        img_3d = img_bgr.copy()
-                        for projection in frame_projections:
-                            for start, end in BOX_EDGES:
-                                p_start = projection.vertices_image[start]
-                                p_end = projection.vertices_image[end]
-                                inside_start = point_in_canvas(p_start, image_w, image_h)
-                                inside_end = point_in_canvas(p_end, image_w, image_h)
-                                if not inside_start and not inside_end:
-                                    continue
-                                if (
-                                    projection.vertices_camera[start][2] <= 0
-                                    and projection.vertices_camera[end][2] <= 0
-                                ):
-                                    continue
-                                pt1 = (int(round(p_start[0])), int(round(p_start[1])))
-                                pt2 = (int(round(p_end[0])), int(round(p_end[1])))
-                                cv2.line(img_3d, pt1, pt2, (0, 255, 0), 1)
-                        detect3d_path = detect_3d_dir / f"{image.frame:06d}.png"
-                        cv2.imwrite(str(detect3d_path), img_3d)
-
-                    if args.save_voc and Writer and voc_dir:
-                        # Ensure raw image exists for Pascal VOC reference.
-                        if raw_path is None and img_bgr is not None:
-                            raw_path = output_dir / f"{image.frame:06d}.png"
-                            cv2.imwrite(str(raw_path), img_bgr)
-                        if raw_path is None:
-                            logging.warning(
-                                "Skipping VOC export for frame %s (image missing)", image.frame
-                            )
-                        else:
-                            writer = Writer(str(raw_path), image_w, image_h)
-                            for box in frame_boxes:
-                                writer.addObject(
-                                    box.label,
-                                    int(round(box.x_min)),
-                                    int(round(box.y_min)),
-                                    int(round(box.x_max)),
-                                    int(round(box.y_max)),
-                                )
-                            voc_path = voc_dir / f"{image.frame:06d}.xml"
-                            writer.save(str(voc_path))
-
-                    if args.save_json:
-                        annotations.append(
-                            {
-                                "frame": int(image.frame),
-                                "timestamp": float(image.timestamp),
-                                "boxes": [box.as_dict() for box in frame_boxes],
-                            }
+                    if raw_path is None:
+                        logging.warning(
+                            "Skipping VOC export for frame %s (image missing)", image.frame
                         )
+                    else:
+                        writer = Writer(str(raw_path), image_w, image_h)
+                        for box in frame_boxes:
+                            writer.addObject(
+                                box.label,
+                                int(round(box.x_min)),
+                                int(round(box.y_min)),
+                                int(round(box.x_max)),
+                                int(round(box.y_max)),
+                            )
+                        voc_path = voc_dir / f"{image.frame:06d}.xml"
+                        writer.save(str(voc_path))
 
-                    logging.debug(
-                        "Frame %s captured %d bounding box(es)", image.frame, len(frame_boxes)
+                if args.save_json:
+                    annotations.append(
+                        {
+                            "frame": int(image.frame),
+                            "timestamp": float(image.timestamp),
+                            "boxes": [box.as_dict() for box in frame_boxes],
+                        }
                     )
 
-                    saved_frames += 1
+                logging.debug(
+                    "Frame %s captured %d bounding box(es)", image.frame, len(frame_boxes)
+                )
+
+                saved_frames += 1
 
     except KeyboardInterrupt:  # pragma: no cover - manual run
         logging.info("Interrupted by user")

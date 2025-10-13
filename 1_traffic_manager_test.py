@@ -53,7 +53,7 @@ def synchronous_mode(
         yield
         return
 
-    # carla.WorldSettings 没有复制构造函数，需要显式构造新的实例。
+    # carla.WorldSettings lacks a copy constructor, so we rebuild a new instance explicitly.
     target_fixed_delta = (
         fixed_delta
         if fixed_delta is not None
